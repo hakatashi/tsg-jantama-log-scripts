@@ -1,0 +1,19 @@
+{
+  "ts-node": {
+    "files": true
+  },
+  "include": [
+    "**/*"
+  ],
+  "compilerOptions": {
+    "target": "es2015",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "noImplicitAny": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "lib": ["es2021", "DOM"],
+    "skipLibCheck": true,
+    "experimentalDecorators": true
+  }
+}
