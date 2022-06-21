@@ -3,8 +3,11 @@ import * as firebase from 'firebase-admin';
 // @ts-ignore
 import { processRecordDataForGameId } from 'amae-koromo';
 import type { lq } from 'amae-koromo/majsoulPb';
+import { google } from 'googleapis';
 import fs from 'fs-extra';
-import {inspect} from 'util';
+import { chunk } from 'lodash';
+
+const BATTLE_LOG_ID = '1Ku67kvpt0oP6PZL7F_6AreQLiiuLq8k8P0qEDCcIqXI';
 
 interface Player {
   亲: boolean,
@@ -21,9 +24,24 @@ interface Player {
   和: [number, number[], number],
   最終手牌: string[],
   和牌: string,
+  副露牌: string[],
+  途中流局: number,
+}
+
+interface PhaseResult {
+  paipuId: string,
+  name: string,
+  agariPlayer: string,
+  agariHitPlayer: string,
+  type: string,
+  point: number,
+  fans: string,
+  role: string,
 }
 
 type Phase = Player[];
+
+type MingPai = {name: string, isSide: boolean};
 
 const fanNames = new Map([
   [1, '門前清自摸和'],
@@ -117,24 +135,151 @@ const paiNames = new Map([
 ]);
 
 const defaultApp = firebase.initializeApp({
-  credential: firebase.credential.applicationDefault(),
+  credential: firebase.credential.cert('google_application_credentials_prod.json'),
   databaseURL: process.env.FIREBASE_ENDPOINT,
 });
 
 const db = firebase.firestore(defaultApp);
 
+const getSheetsData = async (spreadsheetId: string, range: string) => {
+  const auth = await new google.auth.GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  }).getClient();
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  const sheetsData = await new Promise<string[][]>((resolve, reject) => {
+    sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range,
+    }, (error, response) => {
+      if (error) {
+        reject(error);
+      } else if (response.data.values) {
+        resolve(response.data.values as string[][]);
+      } else {
+        reject(new Error('values not found'));
+      }
+    });
+  });
+
+  return sheetsData;
+};
+
+const appendResultToHistory = async (phases: PhaseResult[], targetRange: string) => {
+  const auth = await new google.auth.GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  }).getClient();
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  await new Promise<any>((resolve, reject) => {
+    sheets.spreadsheets.values.append({
+      spreadsheetId: BATTLE_LOG_ID,
+      range: targetRange,
+      insertDataOption: 'INSERT_ROWS',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        range: targetRange,
+        majorDimension: 'ROWS',
+        values: phases.map((phase) => [
+          `=HYPERLINK("https://game.mahjongsoul.com/?paipu=${phase.paipuId}", "${phase.paipuId}")`,
+          phase.name,
+          phase.type,
+          phase.point.toString(),
+          phase.role,
+          phase.agariPlayer,
+          phase.agariHitPlayer,
+          phase.fans,
+        ]),
+      },
+    }, (error, response) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(response);
+      }
+    });
+  });
+};
+
+const encodeMings = (mings: string[]) => (
+  mings.map((ming) => {
+    const [type, paisString] = ming.split(/[()]/);
+    const [pai1, pai2, pai3, pai4] = paisString.split(',').map((pai) => paiNames.get(pai));
+    if (type === 'shunzi') {
+      return [
+        {name: pai3, isSide: true},
+        {name: pai1, isSide: false},
+        {name: pai2, isSide: false},
+      ] as MingPai[];
+    }
+    if (type === 'kezi') {
+      return [
+        {name: pai1, isSide: false},
+        {name: pai2, isSide: true},
+        {name: pai3, isSide: false},
+      ] as MingPai[];
+    }
+    if (type === 'minggang') {
+      return [
+        {name: pai1, isSide: true},
+        {name: pai2, isSide: false},
+        {name: pai3, isSide: false},
+        {name: pai4, isSide: false},
+      ] as MingPai[];
+    }
+    if (type === 'angang') {
+      return [
+        {name: pai1, isSide: false},
+        {name: '麻雀牌', isSide: false},
+        {name: '麻雀牌', isSide: false},
+        {name: pai4, isSide: false},
+      ] as MingPai[];
+    }
+    throw new Error(`Unknown ming type: ${type}`);
+  })
+);
+
+const encodeFans = (fans: string[]) => {
+  let doraCount = 0;
+  const uniqueFans = new Set();
+  for (const fan of fans) {
+    if (fan?.includes('ドラ')) {
+      doraCount++;
+    } else {
+      uniqueFans.add(fan);
+    }
+  }
+  const fanString = [...uniqueFans].join('・');
+  if (doraCount > 0) {
+    return `${fanString}・ドラ${doraCount}`;
+  }
+  return fanString;
+};
+
 (async () => {
+  const paipuSheets = [
+    ...(await getSheetsData(BATTLE_LOG_ID, '局一覧!A:A')),
+    ...(await getSheetsData(BATTLE_LOG_ID, '局一覧 (三麻)!A:A')),
+  ];
+  
+  const existingPaipuIds = new Set(paipuSheets.map(([paipuId]) => paipuId));
+
   const dataDefinition = await fs.readJson('dataDefinition.json');
   const paipus = await db.collection('jantama_paipu').get();
 
+  const yonmaPhaseResults = [] as PhaseResult[];
+  const sammaPhaseResults = [] as PhaseResult[];
+
   for (const doc of paipus.docs) {
     const paipuId = doc.id;
+    if (existingPaipuIds.has(paipuId)) {
+      continue;
+    }
+
     const {game, data} = doc.data() as {game: lq.RecordGame, data: Buffer};
+    console.log(`Processing ${paipuId}`);
 
     try {
-      if (paipuId === '211122-5d5e00aa-6faa-44cf-be4c-8c778e034733') {
-        continue;
-      }
       await processRecordDataForGameId({
         saveRoundData: (game: lq.RecordGame, phases: Phase[]) => {
           const gameDate = new Date(game.start_time * 1000);
@@ -168,6 +313,8 @@ const db = firebase.firestore(defaultApp);
               }
             }
 
+            const phaseResults = players.length === 4 ? yonmaPhaseResults : sammaPhaseResults;
+
             if (agariPlayer !== null && agariAccount !== null) {
               let playerNameString = agariAccount.nickname;
               if (agariType === 'ロン') {
@@ -177,10 +324,54 @@ const db = firebase.firestore(defaultApp);
               const 最終手牌 = agariPlayer.最終手牌.map(pai => `[/icons/${paiNames.get(pai)}.icon]`).join(' ');
               const 和牌 = `[/icons/${paiNames.get(agariPlayer.和牌)}.icon]`;
 
+              const mings = encodeMings(agariPlayer.副露牌 ?? []);
+              const mingString = mings.map((ming) => (
+                ming.map((pai) => (
+                  pai.isSide ? `[!# [/icons/${pai.name}.icon]]` : `[/icons/${pai.name}.icon]`
+                )).join(' ')
+              )).join('   ');
+
+              const fanString = encodeFans(agariPlayer.和[1].map((fan) => fanNames.get(fan)));
+
               console.log('');
               console.log(`[* ${phaseString}] ${playerNameString} [[${agariType}]] ${agariPlayer.和[0]}点`);
-              console.log(`${最終手牌}   ${和牌}`);
-              console.log(agariPlayer.和[1].map(fan => fanNames.get(fan)).join('・'));
+              console.log(`${最終手牌}   ${和牌}      ${mingString}`.trim());
+              console.log(fanString);
+
+              phaseResults.push({
+                paipuId,
+                name: phaseString,
+                agariPlayer: agariAccount?.nickname ?? '',
+                agariHitPlayer: agariHitAccount?.nickname ?? '',
+                type: agariType,
+                point: agariPlayer.和[0],
+                fans: fanString,
+                role: agariPlayer.亲 ? '親' : '子',
+              });
+            } else if (players[0].途中流局) {
+              const type = ['九種九牌', '四風連打', '四槓散了', '四家立直'][players[0].途中流局 - 1];
+
+              phaseResults.push({
+                paipuId,
+                name: phaseString,
+                agariPlayer: '',
+                agariHitPlayer: '',
+                type,
+                point: 0,
+                fans: '',
+                role: '',
+              });
+            } else {
+              phaseResults.push({
+                paipuId,
+                name: phaseString,
+                agariPlayer: '',
+                agariHitPlayer: '',
+                type: '流局',
+                point: 0,
+                fans: '',
+                role: '',
+              });
             }
           }
         },
@@ -188,9 +379,18 @@ const db = firebase.firestore(defaultApp);
         game,
         dataDefinition,
       });
-      break;
     } catch (e) {
       console.error(`Error processing ${paipuId}: ${e}`);
     }
+  }
+
+  console.log(yonmaPhaseResults.length);
+  for (const results of chunk(yonmaPhaseResults, 100)) {
+    await appendResultToHistory(results, '局一覧!A:H');
+  }
+
+  console.log(sammaPhaseResults.length);
+  for (const results of chunk(sammaPhaseResults, 100)) {
+    await appendResultToHistory(results, '局一覧 (三麻)!A:H');
   }
 })();
