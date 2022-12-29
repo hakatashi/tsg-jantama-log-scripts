@@ -6,6 +6,8 @@ import type { lq } from 'amae-koromo/majsoulPb';
 import { google } from 'googleapis';
 import fs from 'fs-extra';
 import { chunk } from 'lodash';
+// @ts-ignore
+import { createMajsoulConnection } from 'amae-koromo/majsoul';
 
 const BATTLE_LOG_ID = '1Ku67kvpt0oP6PZL7F_6AreQLiiuLq8k8P0qEDCcIqXI';
 
@@ -26,6 +28,11 @@ interface Player {
   和牌: string,
   副露牌: string[],
   途中流局: number,
+  チー?: number,
+  ポン?: number,
+  大明槓?: number,
+  加槓?: number,
+  暗槓?: number,
 }
 
 interface PhaseResult {
@@ -37,6 +44,13 @@ interface PhaseResult {
   point: number,
   fans: string,
   role: string,
+}
+
+interface Event {
+  paipuId: string,
+  name: string,
+  type: string,
+  player: string,
 }
 
 type Phase = Player[];
@@ -141,6 +155,43 @@ const defaultApp = firebase.initializeApp({
 
 const db = firebase.firestore(defaultApp);
 
+interface GameRecord {
+  data: Buffer,
+  head: lq.RecordGame;
+}
+
+const recordGame = (id: string, data: Buffer, game: lq.RecordGame) => (
+  db.collection('jantama_paipu').doc(id).set({
+    data,
+    game: JSON.parse(JSON.stringify(game)),
+  })
+);
+
+const getMajsoulLog = async (id: string) => {
+  if (db) {
+    const paipu = await db.collection('jantama_paipu').doc(id).get();
+    console.log(paipu);
+    if (paipu.exists) {
+      return null;
+    }
+  }
+
+  // await new Promise((resolve) => setTimeout(resolve, 10000));
+  const connection = await createMajsoulConnection();
+  const resp: GameRecord = await connection.rpcCall('.lq.Lobby.fetchGameRecord', {
+    game_uuid: id,
+    client_version_string: connection.clientVersionString,
+  });
+  connection.close();
+
+  if (db) {
+    recordGame(id, resp.data, resp.head);
+  }
+
+  return resp.head;
+};
+
+
 const getSheetsData = async (spreadsheetId: string, range: string) => {
   const auth = await new google.auth.GoogleAuth({
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
@@ -189,6 +240,38 @@ const appendResultToHistory = async (phases: PhaseResult[], targetRange: string)
           phase.agariPlayer,
           phase.agariHitPlayer,
           phase.fans,
+        ]),
+      },
+    }, (error, response) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(response);
+      }
+    });
+  });
+};
+
+const appendEventsToHistory = async (events: Event[], targetRange: string) => {
+  const auth = await new google.auth.GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  }).getClient();
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  await new Promise<any>((resolve, reject) => {
+    sheets.spreadsheets.values.append({
+      spreadsheetId: BATTLE_LOG_ID,
+      range: targetRange,
+      insertDataOption: 'INSERT_ROWS',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        range: targetRange,
+        majorDimension: 'ROWS',
+        values: events.map((event) => [
+          `=HYPERLINK("https://game.mahjongsoul.com/?paipu=${event.paipuId}", "${event.paipuId}")`,
+          event.name,
+          event.type,
+          event.player,
         ]),
       },
     }, (error, response) => {
@@ -257,6 +340,28 @@ const encodeFans = (fans: string[]) => {
 };
 
 (async () => {
+  {
+    const paipuSheets = [
+      ...(await getSheetsData(BATTLE_LOG_ID, '局一覧!A:A')),
+      ...(await getSheetsData(BATTLE_LOG_ID, '局一覧 (三麻)!A:A')),
+    ];
+    
+    const existingPaipuIds = new Set(paipuSheets.map(([paipuId]) => paipuId));
+
+    const sheetsData1 = await getSheetsData(BATTLE_LOG_ID, 'log!B:B');
+    const sheetsData2 = await getSheetsData(BATTLE_LOG_ID, 'samma!B:B');
+
+    const paipuIds = [
+      ...sheetsData1.slice(1).map((cells) => cells[0]),
+      ...sheetsData2.slice(1).map((cells) => cells[0]),
+    ];
+
+    for (const paipuId of paipuIds.filter((paipuId) => !existingPaipuIds.has(paipuId)).reverse()) {
+      console.log(`Processing ${paipuId}...`);
+      await getMajsoulLog(paipuId);
+    }
+  }
+
   const paipuSheets = [
     ...(await getSheetsData(BATTLE_LOG_ID, '局一覧!A:A')),
     ...(await getSheetsData(BATTLE_LOG_ID, '局一覧 (三麻)!A:A')),
@@ -264,17 +369,32 @@ const encodeFans = (fans: string[]) => {
   
   const existingPaipuIds = new Set(paipuSheets.map(([paipuId]) => paipuId));
 
+  const eventSheets = [
+    ...(await getSheetsData(BATTLE_LOG_ID, 'イベント一覧!A:A')),
+    ...(await getSheetsData(BATTLE_LOG_ID, 'イベント一覧 (三麻)!A:A')),
+  ];
+  
+  const existingEventPaipuIds = new Set(eventSheets.map(([paipuId]) => paipuId));
+
   const dataDefinition = await fs.readJson('dataDefinition.json');
   const paipus = await db.collection('jantama_paipu').get();
 
   const yonmaPhaseResults = [] as PhaseResult[];
   const sammaPhaseResults = [] as PhaseResult[];
+  const ポンCount = new Map<number, number>();
+  const チーCount = new Map<number, number>();
+  const 大明槓Count = new Map<number, number>();
+  const 加槓Count = new Map<number, number>();
+  const 暗槓Count = new Map<number, number>();
+  const 副露Count = new Map<number, number>();
+  const 立直Count = new Map<number, number>();
+  const accountIds = new Set<number>();
+
+  const yonmaEvents = [] as Event[];
+  const sanmaEvents = [] as Event[];
 
   for (const doc of paipus.docs) {
     const paipuId = doc.id;
-    if (existingPaipuIds.has(paipuId)) {
-      continue;
-    }
 
     const {game, data} = doc.data() as {game: lq.RecordGame, data: Buffer};
     console.log(`Processing ${paipuId}`);
@@ -293,7 +413,12 @@ const encodeFans = (fans: string[]) => {
             let agariType = 'ツモ';
             let agariHitAccount: lq.RecordGame.IAccountInfo = null;
 
-            for (const [playerIndex, player] of players.entries()) {
+            const playerList = Array.from(players.entries());
+            playerList.sort(([, a], [, b]) => a.亲 ? -1 : b.亲 ? 1 : 0);
+
+            for (const [playerIndex, player] of playerList) {
+              const account = game.accounts.find((account) => account.seat === playerIndex);
+
               if (player.亲) {
                 const {場, 局, 本場} = player;
                 phaseString = `${場}${局}局`;
@@ -303,13 +428,72 @@ const encodeFans = (fans: string[]) => {
               }
 
               if (player.和) {
-                agariAccount = game.accounts[playerIndex] || {nickname: 'CPU'};
+                agariAccount = account || {nickname: 'CPU'};
                 agariPlayer = player;
               }
 
               if (player.放铳) {
                 agariType = 'ロン';
-                agariHitAccount = game.accounts[playerIndex] || {nickname: 'CPU'};
+                agariHitAccount = account || {nickname: 'CPU'};
+              }
+
+              const accountId = game.accounts[playerIndex]?.account_id;
+              if (accountId && players.length === 4) {
+                accountIds.add(accountId);
+                if (player.チー) {
+                  チーCount.set(accountId, (チーCount.get(accountId) ?? 0) + player.チー);
+                }
+                if (player.ポン) {
+                  ポンCount.set(accountId, (ポンCount.get(accountId) ?? 0) + player.ポン);
+                }
+                if (player.大明槓) {
+                  大明槓Count.set(accountId, (大明槓Count.get(accountId) ?? 0) + player.大明槓);
+                }
+                if (player.加槓) {
+                  加槓Count.set(accountId, (加槓Count.get(accountId) ?? 0) + player.加槓);
+                }
+                if (player.暗槓) {
+                  暗槓Count.set(accountId, (暗槓Count.get(accountId) ?? 0) + player.暗槓);
+                }
+                if (player.チー || player.ポン || player.大明槓) {
+                  副露Count.set(accountId, (副露Count.get(accountId) ?? 0) + 1);
+                }
+                if (player.立直) {
+                  立直Count.set(accountId, (立直Count.get(accountId) ?? 0) + 1);
+                }
+              }
+
+              if (!existingEventPaipuIds.has(paipuId)) {
+                const events = players.length === 4 ? yonmaEvents : sanmaEvents;
+                type EventType = 'チー' | 'ポン' | '大明槓' | '加槓' | '暗槓';
+                for (const type of ['チー', 'ポン', '大明槓', '加槓', '暗槓'] as EventType[]) {
+                  if (player[type]) {
+                    for (const _i of Array(player[type]).keys()) {
+                      events.push({
+                        paipuId,
+                        type,
+                        player: account?.nickname ?? 'CPU',
+                        name: phaseString,
+                      });
+                    }
+                  }
+                }
+                if (player.立直) {
+                  events.push({
+                    paipuId,
+                    type: '立直',
+                    player: account?.nickname ?? 'CPU',
+                    name: phaseString,
+                  });
+                }
+                if (player.チー || player.ポン || player.大明槓) {
+                  events.push({
+                    paipuId,
+                    type: '副露',
+                    player: account?.nickname ?? 'CPU',
+                    name: phaseString,
+                  });
+                }
               }
             }
 
@@ -338,40 +522,46 @@ const encodeFans = (fans: string[]) => {
               console.log(`${最終手牌}   ${和牌}      ${mingString}`.trim());
               console.log(fanString);
 
-              phaseResults.push({
-                paipuId,
-                name: phaseString,
-                agariPlayer: agariAccount?.nickname ?? '',
-                agariHitPlayer: agariHitAccount?.nickname ?? '',
-                type: agariType,
-                point: agariPlayer.和[0],
-                fans: fanString,
-                role: agariPlayer.亲 ? '親' : '子',
-              });
+              if (!existingPaipuIds.has(paipuId)) {
+                phaseResults.push({
+                  paipuId,
+                  name: phaseString,
+                  agariPlayer: agariAccount?.nickname ?? '',
+                  agariHitPlayer: agariHitAccount?.nickname ?? '',
+                  type: agariType,
+                  point: agariPlayer.和[0],
+                  fans: fanString,
+                  role: agariPlayer.亲 ? '親' : '子',
+                });
+              }
             } else if (players[0].途中流局) {
               const type = ['九種九牌', '四風連打', '四槓散了', '四家立直'][players[0].途中流局 - 1];
 
-              phaseResults.push({
-                paipuId,
-                name: phaseString,
-                agariPlayer: '',
-                agariHitPlayer: '',
-                type,
-                point: 0,
-                fans: '',
-                role: '',
-              });
+              if (!existingPaipuIds.has(paipuId)) {
+                phaseResults.push({
+                  paipuId,
+                  name: phaseString,
+                  agariPlayer: '',
+                  agariHitPlayer: '',
+                  type,
+                  point: 0,
+                  fans: '',
+                  role: '',
+                });
+              }
             } else {
-              phaseResults.push({
-                paipuId,
-                name: phaseString,
-                agariPlayer: '',
-                agariHitPlayer: '',
-                type: '流局',
-                point: 0,
-                fans: '',
-                role: '',
-              });
+              if (!existingPaipuIds.has(paipuId)) {
+                phaseResults.push({
+                  paipuId,
+                  name: phaseString,
+                  agariPlayer: '',
+                  agariHitPlayer: '',
+                  type: '流局',
+                  point: 0,
+                  fans: '',
+                  role: '',
+                });
+              }
             }
           }
         },
@@ -384,6 +574,17 @@ const encodeFans = (fans: string[]) => {
     }
   }
 
+  for (const accountId of accountIds) {
+    const v1 = ポンCount.get(accountId) ?? 0;
+    const v2 = チーCount.get(accountId) ?? 0;
+    const v3 = 大明槓Count.get(accountId) ?? 0;
+    const v4 = 加槓Count.get(accountId) ?? 0;
+    const v5 = 暗槓Count.get(accountId) ?? 0;
+    const v6 = 副露Count.get(accountId) ?? 0;
+    const v7 = 立直Count.get(accountId) ?? 0;
+    console.log(`${accountId} ${v1} ${v2} ${v3} ${v4} ${v5} ${v6} ${v7}`);
+  }
+
   console.log(yonmaPhaseResults.length);
   for (const results of chunk(yonmaPhaseResults, 100)) {
     await appendResultToHistory(results, '局一覧!A:H');
@@ -392,5 +593,17 @@ const encodeFans = (fans: string[]) => {
   console.log(sammaPhaseResults.length);
   for (const results of chunk(sammaPhaseResults, 100)) {
     await appendResultToHistory(results, '局一覧 (三麻)!A:H');
+  }
+
+  console.log(yonmaEvents.length);
+  for (const results of chunk(yonmaEvents, 100)) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await appendEventsToHistory(results, 'イベント一覧!A:D');
+  }
+
+  console.log(sanmaEvents.length);
+  for (const results of chunk(sanmaEvents, 100)) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await appendEventsToHistory(results, 'イベント一覧 (三麻)!A:D');
   }
 })();
