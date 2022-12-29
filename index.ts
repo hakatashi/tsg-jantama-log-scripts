@@ -381,14 +381,6 @@ const encodeFans = (fans: string[]) => {
 
   const yonmaPhaseResults = [] as PhaseResult[];
   const sammaPhaseResults = [] as PhaseResult[];
-  const ポンCount = new Map<number, number>();
-  const チーCount = new Map<number, number>();
-  const 大明槓Count = new Map<number, number>();
-  const 加槓Count = new Map<number, number>();
-  const 暗槓Count = new Map<number, number>();
-  const 副露Count = new Map<number, number>();
-  const 立直Count = new Map<number, number>();
-  const accountIds = new Set<number>();
 
   const yonmaEvents = [] as Event[];
   const sanmaEvents = [] as Event[];
@@ -435,32 +427,6 @@ const encodeFans = (fans: string[]) => {
               if (player.放铳) {
                 agariType = 'ロン';
                 agariHitAccount = account || {nickname: 'CPU'};
-              }
-
-              const accountId = game.accounts[playerIndex]?.account_id;
-              if (accountId && players.length === 4) {
-                accountIds.add(accountId);
-                if (player.チー) {
-                  チーCount.set(accountId, (チーCount.get(accountId) ?? 0) + player.チー);
-                }
-                if (player.ポン) {
-                  ポンCount.set(accountId, (ポンCount.get(accountId) ?? 0) + player.ポン);
-                }
-                if (player.大明槓) {
-                  大明槓Count.set(accountId, (大明槓Count.get(accountId) ?? 0) + player.大明槓);
-                }
-                if (player.加槓) {
-                  加槓Count.set(accountId, (加槓Count.get(accountId) ?? 0) + player.加槓);
-                }
-                if (player.暗槓) {
-                  暗槓Count.set(accountId, (暗槓Count.get(accountId) ?? 0) + player.暗槓);
-                }
-                if (player.チー || player.ポン || player.大明槓) {
-                  副露Count.set(accountId, (副露Count.get(accountId) ?? 0) + 1);
-                }
-                if (player.立直) {
-                  立直Count.set(accountId, (立直Count.get(accountId) ?? 0) + 1);
-                }
               }
 
               if (!existingEventPaipuIds.has(paipuId)) {
@@ -572,17 +538,6 @@ const encodeFans = (fans: string[]) => {
     } catch (e) {
       console.error(`Error processing ${paipuId}: ${e}`);
     }
-  }
-
-  for (const accountId of accountIds) {
-    const v1 = ポンCount.get(accountId) ?? 0;
-    const v2 = チーCount.get(accountId) ?? 0;
-    const v3 = 大明槓Count.get(accountId) ?? 0;
-    const v4 = 加槓Count.get(accountId) ?? 0;
-    const v5 = 暗槓Count.get(accountId) ?? 0;
-    const v6 = 副露Count.get(accountId) ?? 0;
-    const v7 = 立直Count.get(accountId) ?? 0;
-    console.log(`${accountId} ${v1} ${v2} ${v3} ${v4} ${v5} ${v6} ${v7}`);
   }
 
   console.log(yonmaPhaseResults.length);
